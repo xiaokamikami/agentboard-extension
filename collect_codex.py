@@ -33,7 +33,7 @@ SESSION_TAIL_SECS = 2 * 60
 AGENTBOARD_SCRIPT_RELEASE = "2026-04-30"
 __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
-ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.6"
+ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.7"
 ZCODE_DB_DEFAULT = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
 # Only collect ZCode usage from the last N days; older days were already uploaded
 # and stay on the server. Keeps scan time, memory and state file bounded.
@@ -662,7 +662,17 @@ def parse_session(session_file):
 
 
 def zcode_db_path():
-    return os.path.expanduser(os.environ.get("AGENTBOARD_ZCODE_DB", ZCODE_DB_DEFAULT))
+    env_value = os.environ.get("AGENTBOARD_ZCODE_DB", "").strip()
+    if env_value:
+        return os.path.expanduser(env_value)
+    try:
+        with open(os.path.join(AGENTBOARD_DIR, "config.json"), encoding="utf-8") as f:
+            configured = str((json.load(f) or {}).get("zcode_db_path") or "").strip()
+        if configured:
+            return os.path.expanduser(configured)
+    except Exception:
+        pass
+    return ZCODE_DB_DEFAULT
 
 
 def zcode_db_signature(db_path):
@@ -753,12 +763,12 @@ def zcode_add_request(day, request, session_directory):
     total_input = safe_int(request.get("input_tokens"))
     cache_read = safe_int(request.get("cache_read_input_tokens"))
     cache_creation = safe_int(request.get("cache_creation_input_tokens"))
-    # ZCode input_tokens already includes cached tokens (totalTokens = input + output).
-    # AgentBoard displays tokens_used + cache_read + cache_creation, so upload the
-    # non-cache portion as input to avoid double counting the cache.
-    day["provider_total_tokens"] += safe_int(request.get("computed_total_tokens"))
-    day["input_tokens"] += max(0, total_input - cache_read - cache_creation)
-    day["output_tokens"] += safe_int(request.get("output_tokens"))
+    output_tokens = safe_int(request.get("output_tokens"))
+    # Match Codex collector math: report raw input/output, keep cache as a
+    # separate field, and set tokens_used = provider_total = input + output.
+    day["input_tokens"] += total_input
+    day["output_tokens"] += output_tokens
+    day["provider_total_tokens"] += total_input + output_tokens
     day["reasoning_tokens"] += safe_int(request.get("reasoning_tokens"))
     day["cache_read_tokens"] += cache_read
     day["cache_creation_tokens"] += cache_creation
@@ -807,7 +817,7 @@ def zcode_finalize_day(data, max_minutes):
         "coding_time_mins": clamp_minutes(active_seconds, max_minutes),
         "ai_time_mins": max(1, int(output_tokens / HUMAN_TOKENS_PER_MIN)) if output_tokens else 0,
         "tokens_used": safe_int(data.get("input_tokens")) + output_tokens,
-        "provider_total_tokens": safe_int(data.get("provider_total_tokens")),
+        "provider_total_tokens": safe_int(data.get("input_tokens")) + output_tokens,
         "input_tokens": safe_int(data.get("input_tokens")),
         "output_tokens": output_tokens,
         "cache_read_tokens": safe_int(data.get("cache_read_tokens")),
@@ -1278,7 +1288,7 @@ def recover_token_from_claim(config_path, config):
     return config
 
 
-def post_session(config, session_entry, full_rescan=False, source="codex"):
+def post_session(config, session_entry, full_rescan=False, source="codex", attempts=3):
     payload = json.dumps(
         {
             "token": config["token"],
@@ -1315,24 +1325,35 @@ def post_session(config, session_entry, full_rescan=False, source="codex"):
         }
     )
 
-    req = urllib.request.Request(
-        config["api"],
-        data=payload.encode("utf-8"),
-        headers={"Content-Type": "application/json", "User-Agent": "AgentBoard-CLI/1.0"},
-        method="POST",
-    )
-    try:
-        urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT)
-    except urllib.error.HTTPError as error:
-        body = ""
+    request_body = payload.encode("utf-8")
+    last_error = None
+    for attempt in range(1, max(1, attempts) + 1):
+        req = urllib.request.Request(
+            config["api"],
+            data=request_body,
+            headers={"Content-Type": "application/json", "User-Agent": "AgentBoard-CLI/1.0"},
+            method="POST",
+        )
         try:
-            body = error.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
-        message = f"HTTP {error.code}: {error.reason}"
-        if body:
-            message += f" body={body}"
-        raise RuntimeError(message) from error
+            urllib.request.urlopen(req, timeout=30, context=SSL_CONTEXT)
+            return
+        except urllib.error.HTTPError as error:
+            response_body = ""
+            try:
+                response_body = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                response_body = ""
+            message = f"HTTP {error.code}: {error.reason}"
+            if response_body:
+                message += f" body={response_body}"
+            last_error = RuntimeError(message)
+            if error.code < 500 and error.code != 429:
+                raise last_error from error
+        except Exception as error:
+            last_error = error
+        if attempt < attempts:
+            time.sleep(min(8, attempt * 2))
+    raise last_error
 
 
 def load_sync_state():
@@ -1462,19 +1483,44 @@ def sync_zcode(config, verbose=False):
         return {"scanned": meta.get("scanned", 0), "skipped": len(sessions), "synced": 0, "errors": 0, "state": state_path}
 
     synced = 0
-    try:
-        for entry in pending:
-            if verbose:
-                log_sync(
-                    "posting zcode "
-                    f"session={entry['session_id']} date={entry['date']} "
-                    f"tokens={entry.get('tokens_used', 0)}"
-                )
+    errors = 0
+    uploaded_keys = set()
+    for entry in pending:
+        key = f"{entry['session_id']}|{entry['date']}"
+        if verbose:
+            log_sync(
+                "posting zcode "
+                f"session={entry['session_id']} date={entry['date']} "
+                f"tokens={entry.get('tokens_used', 0)}"
+            )
+        try:
             post_session(config, entry, full_rescan=state_invalidated, source="opencode")
             synced += 1
+            uploaded_keys.add(key)
+        except Exception as error:
+            errors += 1
+            log_sync_error(f"failed to sync {entry.get('session_id')} {entry.get('date')}", error)
+
+    if errors:
+        saved_entries = dict(known_entries)
+        for key in uploaded_keys:
+            saved_entries[key] = next_entries.get(key)
+        try:
+            save_zcode_sync_state(state_path, saved_entries, known_signature)
+        except Exception:
+            pass
+        return {
+            "scanned": meta.get("scanned", 0),
+            "skipped": max(0, len(sessions) - synced - errors),
+            "synced": synced,
+            "errors": errors,
+            "state": state_path,
+        }
+
+    try:
         save_zcode_sync_state(state_path, next_entries, signature)
     except Exception as error:
-        log_sync_error("failed to sync ZCode database", error)
+        log_sync_error("failed to save ZCode sync state", error)
         return {"scanned": meta.get("scanned", 0), "skipped": 0, "synced": synced, "errors": 1, "state": state_path}
     return {"scanned": meta.get("scanned", 0), "skipped": len(sessions) - synced, "synced": synced, "errors": 0, "state": state_path}
 

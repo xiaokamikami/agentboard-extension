@@ -8,7 +8,7 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
 
 - 读取本机 ZCode SQLite 数据库（默认 `~/.zcode/cli/db/db.sqlite`），只读模式打开，不写入。
 - token 数据源为 `model_usage` 表中 `status='completed'` 的请求（`turn_usage` 会严重漏计，约为真实用量的 1/8）。
-- ZCode 的 `input_tokens` 已包含缓存 token，而上报后 AgentBoard 展示总量 = tokens_used + cache_read + cache_creation，因此上传前扣除缓存部分，避免缓存被双倍统计。
+- token 口径与官方 Codex 采集器一致：`input_tokens` / `output_tokens` 原样上报，`tokens_used` = `provider_total_tokens` = input + output；cache 单独记在 `cache_read_tokens` / `cache_creation_tokens`，上传前不再从 input 里扣除。子 agent 是独立 `session_id`，会单独上报。
 - error/cancelled 请求也计入活跃时间窗口（限流重试等待是真实的工作时间），但不产生 token。
 - 活跃窗口算法与官方 `build_engaged_windows` 语义严格一致（10 分钟断档切分、段尾补 gap、单会话 480 分钟 / 单日 960 分钟上限），已通过随机事件序列等价测试。
 - 增量同步：每个 (session, date) 的聚合内容做哈希，存于 `~/.agentboard/zcode-sync-state.<hostname>.json`；无变化不重复上传，依赖服务端 (session_id, user, date) 幂等 upsert。
