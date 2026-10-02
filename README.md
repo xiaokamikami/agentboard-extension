@@ -1,8 +1,8 @@
 # agentboard-zcode
 
-让 [AgentBoard](https://agentboard.cc) 的 Codex 统计合并上报本机 [ZCode](https://zcode.ai) 的 token 用量。
+让 [AgentBoard](https://agentboard.cc) 的统计合并上报本机 [ZCode](https://zcode.ai) 与 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/dsh) 的 token 用量。
 
-AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**ZCode 用量以 `source=opencode` 上传**，会话 ID 为 `opencode:zcode:<session_id>`——这样 ZCode 的消耗在排行榜上单独显示在 OpenCode 名下，不会和真实 Codex 的用量混在一起，方便区分。
+AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**ZCode 与 dsh 的用量都以 `source=opencode` 上传**，会话 ID 分别为 `opencode:zcode:<session_id>` 和 `opencode:dsh:<session_id>`——两者的消耗在排行榜上合并显示在 OpenCode 名下，不会和真实 Codex 的用量混在一起，方便区分。
 
 ## 工作原理
 
@@ -11,13 +11,21 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
 - token 口径与官方 Codex 采集器一致：`input_tokens` / `output_tokens` 原样上报，`tokens_used` = `provider_total_tokens` = input + output；cache 单独记在 `cache_read_tokens` / `cache_creation_tokens`，上传前不再从 input 里扣除。子 agent 是独立 `session_id`，会单独上报。
 - error/cancelled 请求也计入活跃时间窗口（限流重试等待是真实的工作时间），但不产生 token。
 - 活跃窗口算法与官方 `build_engaged_windows` 语义严格一致（10 分钟断档切分、段尾补 gap、单会话 480 分钟 / 单日 960 分钟上限），已通过随机事件序列等价测试。
-- 增量同步：每个 (session, date) 的聚合内容做哈希，存于 `~/.agentboard/zcode-sync-state.<hostname>.json`；无变化不重复上传，依赖服务端 (session_id, user, date) 幂等 upsert。
+- 增量同步：每个 (session, date) 的聚合内容做哈希，存于 `~/.agentboard/zcode-sync-state.<hostname>.json`（dsh 为 `dsh-sync-state.<hostname>.json`）；无变化不重复上传，依赖服务端 (session_id, user, date) 幂等 upsert。
 - 消息/工具只上传数量和工具名计数，不上传 prompt、回复、代码或路径内容。
+
+### DeepSeek Harness (dsh) 采集
+
+- 数据源为 `~/.dsh/sessions/<project>/<session-id>/session.v3.jsonl.zstd` 会话文件，用 `zstd -dc` 解压（回退查找 `/opt/homebrew/bin/zstd` 等绝对路径，适配 launchd 的最小 PATH）。
+- 每个 `assistant/message` 事件的 usage（inputTokens / outputTokens / cacheReadTokens / cacheWriteTokens）按天聚合；同一会话同时存在新旧两份文件时优先取 v3、排除 `.bak`，避免重复计数。
+- 模型调用失败的 attempt（无 usage）同样计入活跃时间，但不产生 token，与 ZCode 的 error 请求口径一致。
+- 已核对：会话文件统计与 dsh 自带 usage 账本（`~/.dsh/dsh-usage/usage-ledger.json`）一致；账本在 dsh 旧版本中有漏记，因此以会话文件为准。
+- dsh 侧同样有快速路径（文件 mtime/size 签名未变即跳过）和 45 天滑动窗口（`AGENTBOARD_DSH_DAYS` 可调）。
 
 ### 静默运行设计（内存与开销不随历史增长）
 
-- **签名快速路径**：每次同步先对 DB 做一次纯 SQL 聚合签名（行数/最大时间戳/token 总和）。签名没变（ZCode 空闲时）直接跳过整个采集流程，只有几毫秒开销。
-- **滑动窗口**：默认只采集最近 45 天（`AGENTBOARD_ZCODE_DAYS` 可调，最小 1）。更早的数据早已上传到服务端，不会再读、不会进 state，扫描时间和内存都是有界的。
+- **签名快速路径**：ZCode 每次同步先做一次纯 SQL 聚合签名（行数/最大时间戳/token 总和）；dsh 用会话文件 mtime/size 签名。签名没变直接跳过整个采集流程，只有几毫秒开销。
+- **滑动窗口**：默认只采集最近 45 天（`AGENTBOARD_ZCODE_DAYS` / `AGENTBOARD_DSH_DAYS` 可调，最小 1）。更早的数据早已上传到服务端，不会再读、不会进 state，扫描时间和内存都是有界的。
 - **合并区间代替事件点**：每天的活动时间用"合并后的区间列表"（每段一条）维护，而不是逐事件点，内存 O(活跃段数) 而非 O(事件数)，重度使用一整天也只有几十个区间。
 - 守护进程（launchd 每 5 分钟）实际运行内存约 **34MB** 峰值；`--summary`（全量诊断用）约为其 9 倍属正常。
 
@@ -49,23 +57,26 @@ AgentBoard 官方采集器目前不支持 ZCode（`collect_zcode.py` 在服务�
 
    首次会全量重发 ZCode 历史；再跑一次应只增量同步活跃会话。
 
-5. launchd 定时任务无需改动（仍是每 5 分钟跑 `--sync`），新采集器会在同一个锁内先同步 Codex 再同步 ZCode。
+5. launchd 定时任务无需改动（仍是每 5 分钟跑 `--sync`），新采集器会在同一个锁内依次同步 Codex、ZCode、dsh。
 
 ### 可配置项
 
-- `AGENTBOARD_ZCODE_DB`：ZCode 数据库路径覆盖（默认 `~/.zcode/cli/db/db.sqlite`），测试或多实例时使用。
-- `AGENTBOARD_ZCODE_DAYS`：滑动窗口天数（默认 45），设得越大回溯的历史越多。改大之后下次同步会把窗口内新纳入的天自动补传（幂等）。
+- `AGENTBOARD_ZCODE_DB`：ZCode 数据库路径覆盖（默认 `~/.zcode/cli/db/db.sqlite`），测试或多实例时使用；也可在 `~/.agentboard/config.json` 里设置 `zcode_db_path`。
+- `AGENTBOARD_DSH_HOME`：dsh 目录覆盖（默认 `~/.dsh`）；也可在 `~/.agentboard/config.json` 里设置 `dsh_home`。
+- `AGENTBOARD_ZCODE_DAYS` / `AGENTBOARD_DSH_DAYS`：滑动窗口天数（默认 45），设得越大回溯的历史越多。改大之后下次同步会把窗口内新纳入的天自动补传（幂等）。
+- `AGENTBOARD_ZSTD_BIN`：zstd 可执行文件路径覆盖（一般不需要；未设置时自动查找 PATH 及 homebrew 常见路径）。
 
 ### 回滚
 
-恢复备份文件即可；ZCode 增量状态文件 `~/.agentboard/zcode-sync-state.*.json` 可一并删除（删除后下次全量重发）。
+恢复备份文件即可；ZCode/dsh 增量状态文件 `~/.agentboard/{zcode,dsh}-sync-state.*.json` 可一并删除（删除后下次全量重发）。
 
 ## 注意事项
 
 - 网站上的数据是**同一账号下所有设备**的合计；单机验证请以本地 `--summary` 为准。
 - 网站"今天"卡片约滞后一天聚合，日趋势图才是当天实时值。
 - 单位换算：1 亿 = 100M = 0.1B，1B = 10 亿。
-- 修改会话语义（如统计口径变化）时需递增脚本内 `ZCODE_SYNC_STATE_VERSION`，强制一次全量重发让服务端覆盖旧数据。
+- 修改会话语义（如统计口径变化）时需递增脚本内对应的 `*_SYNC_STATE_VERSION`，强制一次全量重发让服务端覆盖旧数据。
+- dsh 采集依赖 `zstd` 命令行工具（macOS 上 `brew install zstd`）；未安装时 dsh 部分自动跳过，不影响 Codex/ZCode 同步。
 
 ## 许可
 

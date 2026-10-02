@@ -3,8 +3,9 @@
 AgentBoard Codex session data collector.
 
 PRIVACY: This script ONLY extracts aggregate numeric stats from Codex session
-files. It NEVER reads, stores, or transmits conversation content, code,
-prompts, or responses.
+files, the ZCode SQLite database, and DeepSeek Harness transcripts. It NEVER
+reads, stores, or transmits conversation content, code, prompts, or responses;
+only counts, token totals, tool names, timestamps and duration aggregates.
 """
 
 import glob
@@ -13,9 +14,11 @@ import json
 import os
 import platform as platform_module
 import re
+import shutil
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import time
 import urllib.error
@@ -35,12 +38,18 @@ __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
 ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.7"
 ZCODE_DB_DEFAULT = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+DSH_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:dsh-sessions.1"
+DSH_HOME_DEFAULT = os.path.expanduser("~/.dsh")
 # Only collect ZCode usage from the last N days; older days were already uploaded
 # and stay on the server. Keeps scan time, memory and state file bounded.
 try:
     ZCODE_MAX_DAYS = max(1, int(os.environ.get("AGENTBOARD_ZCODE_DAYS", "45")))
 except ValueError:
     ZCODE_MAX_DAYS = 45
+try:
+    DSH_MAX_DAYS = max(1, int(os.environ.get("AGENTBOARD_DSH_DAYS", str(ZCODE_MAX_DAYS))))
+except ValueError:
+    DSH_MAX_DAYS = ZCODE_MAX_DAYS
 CODEX_REPLAY_GAP_SECS = 10
 CODEX_REPLAY_MIN_EVENTS = 100
 CODEX_PROVIDER_TOTAL_POLICY_START_DATE = "2026-04-21"
@@ -1040,9 +1049,10 @@ def summary_mode(session_dir, verbose=False):
         # Reuse the original Codex summary implementation without duplicating its parser.
         codex_sessions, codex_daily = _codex_summary_data(session_dir, verbose=verbose)
     zcode = zcode_summary_mode(verbose=verbose)
-    sessions = codex_sessions + zcode["sessions"]
+    dsh = dsh_summary_mode(verbose=verbose)
+    sessions = codex_sessions + zcode["sessions"] + dsh["sessions"]
     daily = defaultdict(new_day)
-    for source_daily in (codex_daily, zcode["daily"]):
+    for source_daily in (codex_daily, zcode["daily"], dsh["daily"]):
         for date_str, stats in source_daily.items():
             daily[date_str]["events"].extend(
                 ("summary", normalize_ts(stats["first_event_at"]))
@@ -1050,26 +1060,26 @@ def summary_mode(session_dir, verbose=False):
             )
             for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "lines_added", "lines_removed", "user_msgs", "assistant_msgs", "tool_calls"):
                 daily[date_str][key] += stats.get(key, 0)
-    # Preserve the established Codex daily output and expose ZCode alongside it.
+    # Preserve the established Codex daily output and expose ZCode/DSH alongside it.
     totals = {
-        "total_coding_mins": sum(row.get("coding_time_mins", 0) for row in codex_daily.values()) + zcode["summary"]["total_coding_mins"],
-        "total_ai_mins": sum(row.get("ai_time_mins", 0) for row in codex_daily.values()) + zcode["summary"]["total_ai_mins"],
-        "total_tokens": sum(row.get("tokens_used", 0) for row in codex_daily.values()) + zcode["summary"]["total_tokens"],
-        "total_input_tokens": sum(row.get("input_tokens", 0) for row in codex_daily.values()) + zcode["summary"]["total_input_tokens"],
-        "total_output_tokens": sum(row.get("output_tokens", 0) for row in codex_daily.values()) + zcode["summary"]["total_output_tokens"],
-        "total_lines_changed": sum(row.get("lines_changed", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_changed"],
-        "total_lines_added": sum(row.get("lines_added", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_added"],
-        "total_lines_removed": sum(row.get("lines_removed", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_removed"],
+        "total_coding_mins": sum(row.get("coding_time_mins", 0) for row in codex_daily.values()) + zcode["summary"]["total_coding_mins"] + dsh["summary"]["total_coding_mins"],
+        "total_ai_mins": sum(row.get("ai_time_mins", 0) for row in codex_daily.values()) + zcode["summary"]["total_ai_mins"] + dsh["summary"]["total_ai_mins"],
+        "total_tokens": sum(row.get("tokens_used", 0) for row in codex_daily.values()) + zcode["summary"]["total_tokens"] + dsh["summary"]["total_tokens"],
+        "total_input_tokens": sum(row.get("input_tokens", 0) for row in codex_daily.values()) + zcode["summary"]["total_input_tokens"] + dsh["summary"]["total_input_tokens"],
+        "total_output_tokens": sum(row.get("output_tokens", 0) for row in codex_daily.values()) + zcode["summary"]["total_output_tokens"] + dsh["summary"]["total_output_tokens"],
+        "total_lines_changed": sum(row.get("lines_changed", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_changed"] + dsh["summary"]["total_lines_changed"],
+        "total_lines_added": sum(row.get("lines_added", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_added"] + dsh["summary"]["total_lines_added"],
+        "total_lines_removed": sum(row.get("lines_removed", 0) for row in codex_daily.values()) + zcode["summary"]["total_lines_removed"] + dsh["summary"]["total_lines_removed"],
         "total_sessions": len(sessions),
-        "total_messages": sum(row.get("messages", 0) for row in codex_daily.values()) + zcode["summary"]["total_messages"],
-        "total_assistant_messages": sum(row.get("assistant_messages", 0) for row in codex_daily.values()) + zcode["summary"]["total_assistant_messages"],
-        "total_tool_calls": sum(row.get("tool_calls", 0) for row in codex_daily.values()) + zcode["summary"]["total_tool_calls"],
-        "total_files_touched": sum(row.get("files_touched", 0) for row in codex_daily.values()) + zcode["summary"]["total_files_touched"],
-        "total_days": len(set(codex_daily) | set(zcode["daily"])),
+        "total_messages": sum(row.get("messages", 0) for row in codex_daily.values()) + zcode["summary"]["total_messages"] + dsh["summary"]["total_messages"],
+        "total_assistant_messages": sum(row.get("assistant_messages", 0) for row in codex_daily.values()) + zcode["summary"]["total_assistant_messages"] + dsh["summary"]["total_assistant_messages"],
+        "total_tool_calls": sum(row.get("tool_calls", 0) for row in codex_daily.values()) + zcode["summary"]["total_tool_calls"] + dsh["summary"]["total_tool_calls"],
+        "total_files_touched": sum(row.get("files_touched", 0) for row in codex_daily.values()) + zcode["summary"]["total_files_touched"] + dsh["summary"]["total_files_touched"],
+        "total_days": len(set(codex_daily) | set(zcode["daily"]) | set(dsh["daily"])),
     }
     if verbose:
-        log_sync(f"summary complete: codex_sessions={len(codex_sessions)} zcode_sessions={len(zcode['sessions'])} days={totals['total_days']}")
-    emit_json({"summary": totals, "sessions": sessions, "daily": {**codex_daily, **{f"zcode:{date}": stats for date, stats in zcode["daily"].items()}}})
+        log_sync(f"summary complete: codex_sessions={len(codex_sessions)} zcode_sessions={len(zcode['sessions'])} dsh_sessions={len(dsh['sessions'])} days={totals['total_days']}")
+    emit_json({"summary": totals, "sessions": sessions, "daily": {**codex_daily, **{f"zcode:{date}": stats for date, stats in zcode["daily"].items()}, **{f"dsh:{date}": stats for date, stats in dsh["daily"].items()}}})
 
 
 def _codex_summary_data(session_dir, verbose=False):
@@ -1525,6 +1535,387 @@ def sync_zcode(config, verbose=False):
     return {"scanned": meta.get("scanned", 0), "skipped": len(sessions) - synced, "synced": synced, "errors": 0, "state": state_path}
 
 
+def dsh_home_path():
+    env_value = os.environ.get("AGENTBOARD_DSH_HOME", "").strip()
+    if env_value:
+        return os.path.expanduser(env_value)
+    try:
+        with open(os.path.join(AGENTBOARD_DIR, "config.json"), encoding="utf-8") as f:
+            configured = str((json.load(f) or {}).get("dsh_home") or "").strip()
+        if configured:
+            return os.path.expanduser(configured)
+    except Exception:
+        pass
+    return DSH_HOME_DEFAULT
+
+
+def dsh_find_zstd():
+    candidates = []
+    env_value = os.environ.get("AGENTBOARD_ZSTD_BIN", "").strip()
+    if env_value:
+        candidates.append(env_value)
+    found = shutil.which("zstd")
+    if found:
+        candidates.append(found)
+    candidates.extend(["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd", "/usr/bin/zstd"])
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return ""
+
+
+def dsh_decompress(path, zstd_bin):
+    # dsh stores session transcripts as zstd-compressed JSONL; decompress via the
+    # zstd CLI so the collector stays stdlib-only (no zstandard module needed).
+    try:
+        result = subprocess.run(
+            [zstd_bin, "-dc", "--", path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def dsh_session_files(dsh_home):
+    # Prefer the current v3 transcript when a session kept an upgraded copy of an
+    # older format side by side; never read .bak or lock files.
+    pattern = os.path.join(dsh_home, "sessions", "*", "*", "session*.jsonl.zstd")
+    candidates = {}
+    for path in glob.glob(pattern):
+        name = os.path.basename(path)
+        if name.endswith(".bak") or ".bak" in name:
+            continue
+        session_dir = os.path.dirname(path)
+        session_id = os.path.basename(session_dir)
+        preference = 1 if name.startswith("session.v3.") else 0
+        existing = candidates.get(session_id)
+        if existing is None or preference > existing[0]:
+            candidates[session_id] = (preference, path)
+    return sorted((session_id, path) for session_id, (_, path) in candidates.items())
+
+
+def dsh_files_signature(files):
+    import hashlib
+
+    digest = hashlib.sha1()
+    for session_id, path in files:
+        try:
+            stat_result = os.stat(path)
+            digest.update(f"{session_id}|{stat_result.st_mtime_ns}|{stat_result.st_size}\n".encode("utf-8"))
+        except OSError:
+            digest.update(f"{session_id}|missing\n".encode("utf-8"))
+    return digest.hexdigest()
+
+
+DSH_EVENT_TYPE_RE = re.compile(rb'\{"type": ?"([^"]+)"')
+DSH_PARSED_EVENT_TYPES = {
+    b"session",
+    b"assistant/message",
+    b"user/message",
+    b"tool/call",
+    b"step/start",
+    b"step/end",
+    b"turn/start",
+    b"turn/end",
+    b"tool/result",
+    b"assistant/attempt",
+    b"llm/retry-started",
+}
+
+
+def dsh_parse_session_file(path, zstd_bin, cutoff_ms):
+    # Returns {date_str: day_state} for one transcript. Only aggregate numbers are
+    # kept: token counters, message/tool counts, tool names and event timestamps.
+    # Message text, tool arguments and tool output never enter the day state.
+    raw = dsh_decompress(path, zstd_bin)
+    if raw is None:
+        return None, 0
+    days = {}
+    cwd = ""
+    usage_events = 0
+
+    def day_for(epoch_ms):
+        stamp = zcode_datetime(epoch_ms)
+        if not stamp:
+            return None
+        date_str = stamp.strftime("%Y-%m-%d")
+        day = days.get(date_str)
+        if day is None:
+            day = zcode_day_state()
+            if cwd:
+                day["projects"].add(cwd)
+            days[date_str] = day
+        return day
+
+    for line in raw.split(b"\n"):
+        match = DSH_EVENT_TYPE_RE.match(line)
+        if not match or match.group(1) not in DSH_PARSED_EVENT_TYPES:
+            # Streaming chunk lines are the bulk of the file; skip them without
+            # paying for a full JSON parse.
+            continue
+        kind = match.group(1).decode("utf-8", errors="replace")
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if kind == "session":
+            cwd = str(event.get("cwd") or "")
+            continue
+        epoch_ms = event.get("time")
+        if not isinstance(epoch_ms, int) or epoch_ms < cutoff_ms:
+            continue
+        if kind == "assistant/message":
+            data = event.get("data") or {}
+            usage = data.get("usage") or {}
+            day = day_for(epoch_ms)
+            # Failed attempts (no usage) still count as activity, matching the
+            # ZCode collector's treatment of error requests: real time spent
+            # waiting on the model, but no tokens.
+            if day:
+                zcode_add_point(day, epoch_ms)
+            if not usage:
+                continue
+            usage_events += 1
+            if not day:
+                continue
+            day["input_tokens"] += safe_int(usage.get("inputTokens"))
+            day["output_tokens"] += safe_int(usage.get("outputTokens"))
+            day["cache_read_tokens"] += safe_int(usage.get("cacheReadTokens"))
+            day["cache_creation_tokens"] += safe_int(usage.get("cacheWriteTokens"))
+            day["reasoning_tokens"] += safe_int(usage.get("reasoningTokens"))
+            day["provider_total_tokens"] += safe_int(usage.get("inputTokens")) + safe_int(usage.get("outputTokens"))
+            day["assistant_msgs"] += 1
+        elif kind == "user/message":
+            day = day_for(epoch_ms)
+            if day:
+                day["user_msgs"] += 1
+                zcode_add_point(day, epoch_ms)
+        elif kind == "tool/call":
+            data = event.get("data") or {}
+            day = day_for(epoch_ms)
+            if day:
+                day["tool_calls"] += 1
+                name = str(data.get("name") or "")
+                if name:
+                    day["tool_counts"][name] += 1
+                arguments = data.get("arguments")
+                if isinstance(arguments, str) and '"file_path"' in arguments:
+                    try:
+                        parsed = json.loads(arguments)
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        file_path = parsed.get("file_path")
+                        if isinstance(file_path, str) and file_path:
+                            day["files_touched"].add(file_path)
+                zcode_add_point(day, epoch_ms)
+        else:
+            day = day_for(epoch_ms)
+            if day:
+                zcode_add_point(day, epoch_ms)
+    return days, usage_events
+
+
+def dsh_collect_sessions(verbose=False):
+    dsh_home = dsh_home_path()
+    sessions_dir = os.path.join(dsh_home, "sessions")
+    if not os.path.isdir(sessions_dir):
+        return [], {}, {"status": "no_dsh_sessions", "dsh_home": dsh_home, "scanned": 0}
+    zstd_bin = dsh_find_zstd()
+    if not zstd_bin:
+        return [], {}, {"status": "no_zstd", "dsh_home": dsh_home, "scanned": 0}
+
+    cutoff_ms = int((datetime.now().astimezone() - timedelta(days=DSH_MAX_DAYS - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).timestamp() * 1000)
+    files = dsh_session_files(dsh_home)
+    session_days = {}
+    scanned = 0
+    usage_total = 0
+    for session_id, path in files:
+        try:
+            if os.stat(path).st_mtime * 1000 < cutoff_ms:
+                continue
+        except OSError:
+            continue
+        scanned += 1
+        days, usage_events = dsh_parse_session_file(path, zstd_bin, cutoff_ms)
+        if days is None:
+            if verbose:
+                log_sync(f"failed to decompress dsh session {path}")
+            continue
+        usage_total += usage_events
+        if days:
+            # Upload even sessions whose model calls all failed: like the ZCode
+            # collector, failed attempts still represent engaged time.
+            session_days[session_id] = days
+
+    all_sessions = []
+    merged_days = defaultdict(zcode_day_state)
+    for session_id, days in session_days.items():
+        for date_str, data in sorted(days.items()):
+            stats = zcode_finalize_day(data, MAX_MINS_PER_SESSION)
+            if not stats:
+                continue
+            entry = {
+                "date": date_str,
+                "session_id": f"opencode:dsh:{session_id}",
+                **stats,
+            }
+            all_sessions.append(entry)
+            merged = merged_days[date_str]
+            for key in ("input_tokens", "output_tokens", "reasoning_tokens", "cache_read_tokens", "cache_creation_tokens", "provider_total_tokens", "user_msgs", "assistant_msgs", "tool_calls", "lines_added", "lines_removed"):
+                merged[key] += data.get(key, 0)
+            merged["runs"].extend(data["runs"])
+            merged["projects"].update(data["projects"])
+            for tool_name, count in data["tool_counts"].items():
+                merged["tool_counts"][tool_name] += count
+            merged["files_touched"].update(data["files_touched"])
+
+    daily = {}
+    for date_str, data in merged_days.items():
+        stats = zcode_finalize_day(data, MAX_MINS_PER_DAY)
+        if stats:
+            daily[date_str] = stats
+    return all_sessions, daily, {
+        "status": "ok",
+        "dsh_home": dsh_home,
+        "scanned": scanned,
+        "usage_events": usage_total,
+    }
+
+
+def dsh_summary_mode(verbose=False):
+    sessions, daily, meta = dsh_collect_sessions(verbose=verbose)
+    totals = {
+        "total_coding_mins": sum(row["coding_time_mins"] for row in daily.values()),
+        "total_ai_mins": sum(row["ai_time_mins"] for row in daily.values()),
+        "total_tokens": sum(row["tokens_used"] for row in daily.values()),
+        "total_input_tokens": sum(row["input_tokens"] for row in daily.values()),
+        "total_output_tokens": sum(row["output_tokens"] for row in daily.values()),
+        "total_lines_changed": sum(row["lines_changed"] for row in daily.values()),
+        "total_lines_added": sum(row["lines_added"] for row in daily.values()),
+        "total_lines_removed": sum(row["lines_removed"] for row in daily.values()),
+        "total_sessions": len(sessions),
+        "total_messages": sum(row["messages"] for row in daily.values()),
+        "total_assistant_messages": sum(row["assistant_messages"] for row in daily.values()),
+        "total_tool_calls": sum(row["tool_calls"] for row in daily.values()),
+        "total_files_touched": sum(row["files_touched"] for row in daily.values()),
+        "total_days": len(daily),
+    }
+    return {"summary": totals, "sessions": sessions, "daily": daily, "meta": meta}
+
+
+def load_dsh_sync_state():
+    state_path = os.path.join(AGENTBOARD_DIR, f"dsh-sync-state.{HOST_ID}.json")
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            raw_state = json.load(f)
+    except Exception:
+        return state_path, {}, True, ""
+    if not isinstance(raw_state, dict) or raw_state.get("_collector_version") != DSH_SYNC_STATE_VERSION:
+        return state_path, {}, True, ""
+    entries = raw_state.get("entries")
+    if not isinstance(entries, dict):
+        entries = {}
+    return state_path, entries, False, str(raw_state.get("_files_signature") or "")
+
+
+def save_dsh_sync_state(state_path, entries, files_signature):
+    with open(state_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "_collector_version": DSH_SYNC_STATE_VERSION,
+                "_files_signature": files_signature,
+                "entries": entries,
+            },
+            f,
+            indent=2,
+            sort_keys=True,
+        )
+
+
+def sync_dsh(config, verbose=False):
+    dsh_home = dsh_home_path()
+    state_path, known_entries, state_invalidated, known_signature = load_dsh_sync_state()
+    if not os.path.isdir(os.path.join(dsh_home, "sessions")):
+        return {"scanned": 0, "skipped": 0, "synced": 0, "errors": 0, "state": state_path, "unchanged": True}
+
+    files = dsh_session_files(dsh_home)
+    signature = dsh_files_signature(files)
+    # Fast path: transcript file sizes/mtimes unchanged means nothing to upload.
+    if not state_invalidated and known_signature and known_signature == signature:
+        return {"scanned": 0, "skipped": 0, "synced": 0, "errors": 0, "state": state_path, "unchanged": True}
+
+    sessions, _, meta = dsh_collect_sessions(verbose=verbose)
+    if meta.get("status") not in ("ok",):
+        return {"scanned": meta.get("scanned", 0), "skipped": 0, "synced": 0, "errors": 0, "state": state_path, "unchanged": meta.get("status") == "no_dsh_sessions"}
+
+    pending = []
+    next_entries = {}
+    for entry in sessions:
+        key = f"{entry['session_id']}|{entry['date']}"
+        entry_signature = zcode_entry_signature(entry)
+        next_entries[key] = entry_signature
+        if state_invalidated or known_entries.get(key) != entry_signature:
+            pending.append(entry)
+
+    if not pending:
+        if next_entries != known_entries or known_signature != signature:
+            try:
+                save_dsh_sync_state(state_path, next_entries, signature)
+            except Exception:
+                pass
+        return {"scanned": meta.get("scanned", 0), "skipped": len(sessions), "synced": 0, "errors": 0, "state": state_path}
+
+    synced = 0
+    errors = 0
+    uploaded_keys = set()
+    for entry in pending:
+        key = f"{entry['session_id']}|{entry['date']}"
+        if verbose:
+            log_sync(
+                "posting dsh "
+                f"session={entry['session_id']} date={entry['date']} "
+                f"tokens={entry.get('tokens_used', 0)}"
+            )
+        try:
+            post_session(config, entry, full_rescan=state_invalidated, source="opencode")
+            synced += 1
+            uploaded_keys.add(key)
+        except Exception as error:
+            errors += 1
+            log_sync_error(f"failed to sync {entry.get('session_id')} {entry.get('date')}", error)
+
+    if errors:
+        saved_entries = dict(known_entries)
+        for key in uploaded_keys:
+            saved_entries[key] = next_entries.get(key)
+        try:
+            save_dsh_sync_state(state_path, saved_entries, known_signature)
+        except Exception:
+            pass
+        return {
+            "scanned": meta.get("scanned", 0),
+            "skipped": max(0, len(sessions) - synced - errors),
+            "synced": synced,
+            "errors": errors,
+            "state": state_path,
+        }
+
+    try:
+        save_dsh_sync_state(state_path, next_entries, signature)
+    except Exception as error:
+        log_sync_error("failed to save dsh sync state", error)
+        return {"scanned": meta.get("scanned", 0), "skipped": 0, "synced": synced, "errors": 1, "state": state_path}
+    return {"scanned": meta.get("scanned", 0), "skipped": len(sessions) - synced, "synced": synced, "errors": 0, "state": state_path}
+
+
 def sync_mode(session_dir, verbose=False):
     config = load_config()
     if not config:
@@ -1607,15 +1998,27 @@ def sync_mode(session_dir, verbose=False):
     synced += zcode_result.get("synced", 0)
     errors += zcode_result.get("errors", 0)
 
+    dsh_result = sync_dsh(config, verbose=verbose)
+    scanned += dsh_result.get("scanned", 0)
+    skipped += dsh_result.get("skipped", 0)
+    synced += dsh_result.get("synced", 0)
+    errors += dsh_result.get("errors", 0)
+
     if verbose:
         log_sync(
-            f"scan complete: codex_scanned={scanned - zcode_result.get('scanned', 0)} "
-            f"zcode_scanned={zcode_result.get('scanned', 0)} skipped={skipped} synced={synced} errors={errors}"
+            f"scan complete: codex_scanned={scanned - zcode_result.get('scanned', 0) - dsh_result.get('scanned', 0)} "
+            f"zcode_scanned={zcode_result.get('scanned', 0)} dsh_scanned={dsh_result.get('scanned', 0)} "
+            f"skipped={skipped} synced={synced} errors={errors}"
         )
     if errors == 0:
         mark_last_success()
 
-    if scanned == 0 and not resolved_session_dir and zcode_result.get("scanned", 0) == 0:
+    if (
+        scanned == 0
+        and not resolved_session_dir
+        and zcode_result.get("scanned", 0) == 0
+        and dsh_result.get("scanned", 0) == 0
+    ):
         status = "no_sessions"
     elif errors > 0 and synced == 0:
         status = "error"
@@ -1632,6 +2035,7 @@ def sync_mode(session_dir, verbose=False):
         "synced": synced,
         "errors": errors,
         "zcode": zcode_result,
+        "dsh": dsh_result,
     }
 
 
