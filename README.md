@@ -4,6 +4,8 @@
 
 AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**ZCode 与 dsh 的用量都以 `source=opencode` 上传**，会话 ID 分别为 `opencode:zcode:<session_id>` 和 `opencode:dsh:<session_id>`——两者的消耗在排行榜上合并显示在 OpenCode 名下，不会和真实 Codex 的用量混在一起，方便区分。
 
+仓库里同时归档了官方 Claude Code 采集器的最新快照（`collect.py`，2026-08-31 版），方便多机适配时一并更新——官方安装脚本会把所有采集器内嵌输出，单文件更新无需重跑安装。
+
 ## 工作原理
 
 - 读取本机 ZCode SQLite 数据库（默认 `~/.zcode/cli/db/db.sqlite`），只读模式打开，不写入。
@@ -28,6 +30,11 @@ AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在
 - **滑动窗口**：默认只采集最近 45 天（`AGENTBOARD_ZCODE_DAYS` / `AGENTBOARD_DSH_DAYS` 可调，最小 1）。更早的数据早已上传到服务端，不会再读、不会进 state，扫描时间和内存都是有界的。
 - **合并区间代替事件点**：每天的活动时间用"合并后的区间列表"（每段一条）维护，而不是逐事件点，内存 O(活跃段数) 而非 O(事件数)，重度使用一整天也只有几十个区间。
 - 守护进程（launchd 每 5 分钟）实际运行内存约 **34MB** 峰值；`--summary`（全量诊断用）约为其 9 倍属正常。
+
+### 关于 Claude Code 的两件事（排查经验）
+
+- **网站卡片上 Claude Code 的数字看起来很小是正常的**：卡片主数字是 `tokens_used` = input + output，**不含缓存**；而 Claude Code 会话里缓存通常占 95% 以上。排行榜/卡片的 total tokens 才是含缓存的大口径（`tokens_used + cache_read + cache_creation`）。网站与本地 `--summary` 的 `provider_total_tokens` 逐日精确吻合，可用于验证数据确实在推。
+- **升级 collect.py 时必须先停旧守护进程**，否则旧代码会继续用旧版本号覆盖 state 文件、把已修正的数据翻转回去。正确流程：备份 → 覆盖 `collect.py` → `kill` 旧 daemon PID（`~/.agentboard/claude-sync.<host>.pid`）→ 手动 `--sync` 全量重发 → `nohup python3 ~/.agentboard/collect.py --daemon &` 重启并写回 pid 文件。2026-08-31 版在 `REPARSE_ON_UPGRADE_RELEASES` 里，升级会自动触发一次全量重扫（幂等），修正旧版 `lines_added` 的偏差（实测一天 3162 行 → 4141 行）。
 
 ## 安装
 
@@ -58,6 +65,30 @@ AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在
    首次会全量重发 ZCode 历史；再跑一次应只增量同步活跃会话。
 
 5. launchd 定时任务无需改动（仍是每 5 分钟跑 `--sync`），新采集器会在同一个锁内依次同步 Codex、ZCode、dsh。
+
+### 更新 Claude Code 采集器（collect.py）
+
+仓库里的 `collect.py` 是官方 Claude 采集器的快照（2026-08-31）。官方升级后，本机按下面流程更新（详见上文"关于 Claude Code 的两件事"）：
+
+```bash
+# 1. 备份
+cp ~/.agentboard/collect.py ~/.agentboard/collect.py.bak-$(date +%Y%m%d)
+
+# 2. 覆盖（从本仓库）
+curl -fsSL https://raw.githubusercontent.com/xiaokamikami/agentboard-zcode/main/collect.py -o ~/.agentboard/collect.py
+
+# 3. 停旧守护进程（必须，否则旧代码会把 state 翻转回去）
+kill "$(cat ~/.agentboard/claude-sync.*.pid)" 2>/dev/null
+
+# 4. 全量重扫（版本升级自动触发，幂等）
+python3 ~/.agentboard/collect.py --sync --json
+
+# 5. 重启守护进程并记录 PID
+nohup python3 ~/.agentboard/collect.py --daemon >/dev/null 2>&1 &
+echo $! > ~/.agentboard/claude-sync.$(hostname | tr -c 'A-Za-z0-9_.-' '_').pid
+```
+
+官方最新版可从安装脚本提取（脚本内嵌全部采集器源码，无远程下载）：找 `cat > "$COLLECT_FILE" <<'COLLECTEOF'` 与 `COLLECTEOF` 之间的内容。
 
 ### 可配置项
 
