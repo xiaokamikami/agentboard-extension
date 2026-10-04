@@ -66,6 +66,45 @@ AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在
 
 5. launchd 定时任务无需改动（仍是每 5 分钟跑 `--sync`），新采集器会在同一个锁内依次同步 Codex、ZCode、dsh。
 
+### 更新单个采集器
+
+每个采集器都是独立文件，可以单独更新，互不影响：
+
+| 采集器 | 文件 | 官方最新版来源 | 本机状态 |
+|---|---|---|---|
+| Claude Code | `~/.agentboard/collect.py` | 安装脚本内嵌（heredoc） | 2026-08-31（已更新） |
+| Codex | `~/.agentboard/collect_codex.py` | 安装脚本内嵌（heredoc） | **本仓库补丁版**（勿用官方覆盖） |
+| Gemini CLI | `~/.agentboard/collect_gemini.py` | 安装脚本内嵌（heredoc） | 2026-04-30（最新，无需更新） |
+| Claude Cowork | `~/.agentboard/collect_claude_cowork.py` | 安装脚本内嵌（heredoc） | 最新（无需更新） |
+| OpenCode / OpenClaw / Kimi | `~/.agentboard/collect_*.py` | `https://agentboard.cc/collect_*.py` | 未安装（本机无对应工具） |
+
+- **Claude / Gemini / Cowork**：官方源码内嵌在安装脚本里，从 `cat > "$COLLECT_FILE" <<'COLLECTEOF'` 与 `COLLECTEOF` 之间提取即可。
+- **OpenCode / OpenClaw / Kimi**：官方托管在服务端，直接 `curl https://agentboard.cc/collect_opencode.py` 下载。
+- **Codex：唯一不能用官方文件覆盖的**（见下）。
+
+### 关于覆盖风险（重要）
+
+**没有任何自动更新机制**：安装脚本、hook.sh、launchd 任务、采集器自身都不含下载/更新逻辑，所以本机补丁不会被自动覆盖。唯一的覆盖场景是**你手动重跑官方安装脚本**：
+
+```bash
+curl -sL https://agentboard.cc/install | bash -s -- <TOKEN>   # ← 会覆盖 collect_codex.py
+```
+
+重跑安装脚本时：
+
+- `collect.py`、`collect_gemini.py`、`collect_claude_cowork.py`、`collect_opencode.py` 等会被官方最新版**无条件覆盖**（不备份）——这些没有本地改动，覆盖无害。
+- `collect_codex.py` 会被官方版覆盖，**我们的 ZCode/dsh 采集和内存优化全部丢失**（官方 2026-09-16 版不含 ZCode/dsh 支持）。增量 state 文件（`zcode-sync-state.*.json`、`dsh-sync-state.*.json`）不受影响，装回补丁后会按内容哈希继续增量同步，不会重复上传。
+- launchd plist 也会被重写（官方 Codex 任务间隔从 300s 改回 60s）；不想要的话改回 `StartInterval` 即可。
+
+**防覆盖**：仓库提供 `reapply.sh`，重跑官方安装后执行一次即可装回补丁（含校验，下载到错误内容会中止且不改动现有文件）：
+
+```bash
+bash reapply.sh
+# 或手动：
+curl -fsSL https://raw.githubusercontent.com/xiaokamikami/agentboard-zcode/main/collect_codex.py -o ~/.agentboard/collect_codex.py
+python3 ~/.agentboard/collect_codex.py --summary   # 验证
+```
+
 ### 更新 Claude Code 采集器（collect.py）
 
 仓库里的 `collect.py` 是官方 Claude 采集器的快照（2026-08-31）。官方升级后，本机按下面流程更新（详见上文"关于 Claude Code 的两件事"）：
@@ -108,6 +147,7 @@ echo $! > ~/.agentboard/claude-sync.$(hostname | tr -c 'A-Za-z0-9_.-' '_').pid
 - 单位换算：1 亿 = 100M = 0.1B，1B = 10 亿。
 - 修改会话语义（如统计口径变化）时需递增脚本内对应的 `*_SYNC_STATE_VERSION`，强制一次全量重发让服务端覆盖旧数据。
 - dsh 采集依赖 `zstd` 命令行工具（macOS 上 `brew install zstd`）；未安装时 dsh 部分自动跳过，不影响 Codex/ZCode 同步。
+- 本补丁基于官方 Codex 采集器 2026-04-30 版；官方已更新到 2026-09-16 版（新增 shadow 测量、消息镜像等特性）。如未来要跟进官方新版，需要把 ZCode/dsh 采集块移植到新版上（我们独有的部分：`zcode_*` / `dsh_*` 系列函数、`sync_zcode` / `sync_dsh`、以及 `sync_mode` 里的两处调用），不要直接覆盖。
 
 ## 许可
 
