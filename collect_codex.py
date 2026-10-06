@@ -37,7 +37,13 @@ AGENTBOARD_SCRIPT_RELEASE = "2026-04-30"
 __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
 ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.7"
-ZCODE_DB_DEFAULT = os.path.expanduser("~/.zcode/cli/db/db.sqlite")
+# ZCode was renamed to KCode in 2026-10; both DB layouts are identical, so the
+# collector auto-detects whichever database is the most recently active.
+ZCODE_DB_CANDIDATES = (
+    os.path.expanduser("~/.kcode/cli/db/db.sqlite"),
+    os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
+)
+ZCODE_DB_DEFAULT = ZCODE_DB_CANDIDATES[0]
 DSH_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:dsh-sessions.1"
 DSH_HOME_DEFAULT = os.path.expanduser("~/.dsh")
 # Only collect ZCode usage from the last N days; older days were already uploaded
@@ -681,6 +687,23 @@ def zcode_db_path():
             return os.path.expanduser(configured)
     except Exception:
         pass
+    # Auto-detect: prefer the candidate database that was written most recently,
+    # so the collector follows the ZCode -> KCode rename without reconfiguration.
+    # WAL files count too, since the main db file's mtime can lag behind writes.
+    best_path = ""
+    best_mtime = -1.0
+    for candidate in ZCODE_DB_CANDIDATES:
+        latest = -1.0
+        for path in (candidate, candidate + "-wal", candidate + "-shm"):
+            try:
+                latest = max(latest, os.path.getmtime(path))
+            except OSError:
+                continue
+        if latest > best_mtime:
+            best_mtime = latest
+            best_path = candidate
+    if best_path:
+        return best_path
     return ZCODE_DB_DEFAULT
 
 
