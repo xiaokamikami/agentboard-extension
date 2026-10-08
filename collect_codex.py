@@ -3,7 +3,7 @@
 AgentBoard Codex session data collector.
 
 PRIVACY: This script ONLY extracts aggregate numeric stats from Codex session
-files, the ZCode SQLite database, and DeepSeek Harness transcripts. It NEVER
+files, the ZCode/KCode SQLite database, and DeepSeek Harness transcripts. It NEVER
 reads, stores, or transmits conversation content, code, prompts, or responses;
 only counts, token totals, tool names, timestamps and duration aggregates.
 """
@@ -37,8 +37,7 @@ AGENTBOARD_SCRIPT_RELEASE = "2026-04-30"
 __version__ = AGENTBOARD_SCRIPT_RELEASE
 CODEX_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:codex-replay.1"
 ZCODE_SYNC_STATE_VERSION = f"{AGENTBOARD_SCRIPT_RELEASE}:zcode-sqlite.7"
-# ZCode was renamed to KCode in 2026-10; both DB layouts are identical, so the
-# collector auto-detects whichever database is the most recently active.
+# ZCode 更名后由 KCode 持有用量；优先新库，保留旧安装的路径回退。
 ZCODE_DB_CANDIDATES = (
     os.path.expanduser("~/.kcode/cli/db/db.sqlite"),
     os.path.expanduser("~/.zcode/cli/db/db.sqlite"),
@@ -181,7 +180,8 @@ def log_sync(message):
             f.write(line + "\n")
     except Exception:
         pass
-    if sys.stderr.isatty():
+    # Windows 的 pythonw.exe 没有 stderr，静默计划任务仍需要写日志并继续同步。
+    if sys.stderr is not None and sys.stderr.isatty():
         print(line, file=sys.stderr)
 
 
@@ -677,33 +677,24 @@ def parse_session(session_file):
 
 
 def zcode_db_path():
-    env_value = os.environ.get("AGENTBOARD_ZCODE_DB", "").strip()
-    if env_value:
-        return os.path.expanduser(env_value)
+    for env_key in ("AGENTBOARD_KCODE_DB", "AGENTBOARD_ZCODE_DB"):
+        env_value = os.environ.get(env_key, "").strip()
+        if env_value:
+            return os.path.expanduser(env_value)
     try:
         with open(os.path.join(AGENTBOARD_DIR, "config.json"), encoding="utf-8") as f:
-            configured = str((json.load(f) or {}).get("zcode_db_path") or "").strip()
-        if configured:
-            return os.path.expanduser(configured)
+            config = json.load(f) or {}
+        for config_key in ("kcode_db_path", "zcode_db_path"):
+            configured = str(config.get(config_key) or "").strip()
+            if configured:
+                return os.path.expanduser(configured)
     except Exception:
         pass
-    # Auto-detect: prefer the candidate database that was written most recently,
-    # so the collector follows the ZCode -> KCode rename without reconfiguration.
-    # WAL files count too, since the main db file's mtime can lag behind writes.
-    best_path = ""
-    best_mtime = -1.0
+    # 只读连接也可能刷新旧库的 shm 时间，不能据此判断用量写入者。
+    # 新旧库同时存在时固定优先 KCode，且孤立 sidecar 不能视为主库。
     for candidate in ZCODE_DB_CANDIDATES:
-        latest = -1.0
-        for path in (candidate, candidate + "-wal", candidate + "-shm"):
-            try:
-                latest = max(latest, os.path.getmtime(path))
-            except OSError:
-                continue
-        if latest > best_mtime:
-            best_mtime = latest
-            best_path = candidate
-    if best_path:
-        return best_path
+        if os.path.isfile(candidate):
+            return candidate
     return ZCODE_DB_DEFAULT
 
 

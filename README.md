@@ -1,6 +1,6 @@
 # agentboard-zcode
 
-让 [AgentBoard](https://agentboard.cc) 的统计合并上报本机 [ZCode](https://zcode.ai) 与 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/dsh) 的 token 用量。
+让 [AgentBoard](https://agentboard.cc) 的统计合并上报本机 KCode、[ZCode](https://zcode.ai) 与 [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/dsh) 的 token 用量。
 
 AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在服务端返回 404）。本仓库在官方 `collect_codex.py` 的基础上做了最小侵入修改：**ZCode 与 dsh 的用量都以 `source=opencode` 上传**，会话 ID 分别为 `opencode:zcode:<session_id>` 和 `opencode:dsh:<session_id>`——两者的消耗在排行榜上合并显示在 OpenCode 名下，不会和真实 Codex 的用量混在一起，方便区分。
 
@@ -8,7 +8,7 @@ AgentBoard 官方采集器目前不支持 ZCode 和 dsh（`collect_zcode.py` 在
 
 ## 工作原理
 
-- 读取本机 ZCode/KCode SQLite 数据库（自动探测 `~/.kcode/cli/db/db.sqlite` 与 `~/.zcode/cli/db/db.sqlite` 中最近活跃的那个），只读模式打开，不写入。
+- 读取本机 ZCode/KCode SQLite 数据库（默认优先 `~/.kcode/cli/db/db.sqlite`，新库不存在时回退到 `~/.zcode/cli/db/db.sqlite`），只读模式打开，不写入。
 - token 数据源为 `model_usage` 表中 `status='completed'` 的请求（`turn_usage` 会严重漏计，约为真实用量的 1/8）。
 - token 口径与官方 Codex 采集器一致：`input_tokens` / `output_tokens` 原样上报，`tokens_used` = `provider_total_tokens` = input + output；cache 单独记在 `cache_read_tokens` / `cache_creation_tokens`，上传前不再从 input 里扣除。子 agent 是独立 `session_id`，会单独上报。
 - error/cancelled 请求也计入活跃时间窗口（限流重试等待是真实的工作时间），但不产生 token。
@@ -131,14 +131,20 @@ echo $! > ~/.agentboard/claude-sync.$(hostname | tr -c 'A-Za-z0-9_.-' '_').pid
 
 ### 可配置项
 
-- `AGENTBOARD_ZCODE_DB`：ZCode/KCode 数据库路径覆盖（默认自动探测，见下）；也可在 `~/.agentboard/config.json` 里设置 `zcode_db_path`。
+- `AGENTBOARD_KCODE_DB` / `AGENTBOARD_ZCODE_DB`：ZCode/KCode 数据库路径覆盖（默认自动探测，见下）；也可在 `~/.agentboard/config.json` 里设置 `kcode_db_path` / `zcode_db_path`。优先级为 KCode 环境变量、旧环境变量、KCode 配置、旧配置、默认探测；显式路径优先于默认探测。
 - `AGENTBOARD_DSH_HOME`：dsh 目录覆盖（默认 `~/.dsh`）；也可在 `~/.agentboard/config.json` 里设置 `dsh_home`。
 - `AGENTBOARD_ZCODE_DAYS` / `AGENTBOARD_DSH_DAYS`：滑动窗口天数（默认 45），设得越大回溯的历史越多。改大之后下次同步会把窗口内新纳入的天自动补传（幂等）。
 - `AGENTBOARD_ZSTD_BIN`：zstd 可执行文件路径覆盖（一般不需要；未设置时自动查找 PATH 及 homebrew 常见路径）。
 
 ### ZCode 更名为 KCode（2026-10）
 
-ZCode 在 2026-10 更名为 **KCode**，数据库迁到 `~/.kcode/cli/db/db.sqlite`（旧库 `~/.zcode` 停止写入）。两个库表结构完全相同，新库是旧库的完整超集。采集器会自动选择**最近活跃**的库（比较主库与 `-wal`/`-shm` 的 mtime），无需任何配置即可跟随改名——如果两个库同时存在，跟随正在写入的那一个。若需强制指定，用 `AGENTBOARD_ZCODE_DB` 环境变量或 config 的 `zcode_db_path`。
+KCode 使用 `~/.kcode/cli/db/db.sqlite`。两个主库都存在时，采集器默认固定优先 KCode；只读访问也可能刷新旧库 `-shm` 的时间，因此不以文件时间决定采集所有者。KCode 继续上报为 OpenCode，沿用 `opencode:zcode:<session_id>` 和既有 state，避免改名造成重复计数。
+
+旧版配置若把 `zcode_db_path` 固定在旧库，仍会尊重这个覆盖。切换时在 config 中设置 `kcode_db_path` 指向新库，或更新旧字段；也可用 `AGENTBOARD_KCODE_DB` 环境变量覆盖。
+
+新库未必包含迁移后旧库的全部统计。采集器不合并数据库；补齐本机历史前应使用 SQLite backup API 保存两边快照，按主键事务式补齐 `model_usage`、`turn_usage`、`tool_usage`，保留目标已有记录与新增列默认值，并核对 token 总数与外键。详细规则见 [specs/kcode-statistics.md](specs/kcode-statistics.md)。
+
+回归验证：`python -m unittest discover -s tests -v`，覆盖默认路径、显式配置、改名后的会话标识、OpenCode 归类与重复同步。
 
 ### 回滚
 
